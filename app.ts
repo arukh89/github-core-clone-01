@@ -66,8 +66,13 @@ function treeSha(entries: readonly TreeEntry[]): string {
   return sha1(Buffer.concat([Buffer.from(`tree ${body.length}\0`, 'utf8'), body]));
 }
 
-/** Tree sha of the files under `prefix` ('' = whole tree), recursively. */
-function treeShaForFiles(files: ReadonlyMap<string, FileRec>, prefix: string): string {
+/** Split a file map into the direct files and first-level subdirectories under
+ * `prefix` ('' = whole tree). Shared by treeShaForFiles, storeFileTree and
+ * directoryListing, which previously re-implemented the same split. */
+function partitionFiles(
+  files: ReadonlyMap<string, FileRec>,
+  prefix: string,
+): { direct: Map<string, FileRec>; subdirs: Set<string> } {
   const direct = new Map<string, FileRec>();
   const subdirs = new Set<string>();
   for (const [path, file] of files) {
@@ -77,6 +82,12 @@ function treeShaForFiles(files: ReadonlyMap<string, FileRec>, prefix: string): s
     if (slash === -1) direct.set(rest, file);
     else subdirs.add(rest.slice(0, slash));
   }
+  return { direct, subdirs };
+}
+
+/** Tree sha of the files under `prefix` ('' = whole tree), recursively. */
+function treeShaForFiles(files: ReadonlyMap<string, FileRec>, prefix: string): string {
+  const { direct, subdirs } = partitionFiles(files, prefix);
   const entries: TreeEntry[] = [];
   for (const [name, file] of direct) entries.push({ name, mode: '100644', sha: file.sha });
   for (const name of subdirs) {
@@ -103,9 +114,17 @@ function commitBytes(
   return Buffer.from(body, 'utf8');
 }
 
-function commitSha(tree: string, parent: string | null, message: string): string {
-  const body = commitBytes(tree, parent === null ? [] : [parent], 'Forge <forge@localhost> 0 +0000', 'Forge <forge@localhost> 0 +0000', message);
-  return sha1(Buffer.concat([Buffer.from(`commit ${body.length}\0`, 'utf8'), body]));
+/** Commit object bytes + sha, built once. (Was: commitBytes called twice per
+ * commit — once for the hash, once for the stored object.) */
+function commitObject(tree: string, parent: string | null, message: string): { sha: string; bytes: Buffer } {
+  const bytes = commitBytes(
+    tree,
+    parent === null ? [] : [parent],
+    'Forge <forge@localhost> 0 +0000',
+    'Forge <forge@localhost> 0 +0000',
+    message,
+  );
+  return { sha: sha1(Buffer.concat([Buffer.from(`commit ${bytes.length}\0`, 'utf8'), bytes])), bytes };
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +146,27 @@ interface ParsedCommit {
   author: string;
   committer: string;
   message: string;
+  /** Multi-line `gpgsig` header value (continuations folded), '' when absent. */
+  gpgsig: string;
+}
+
+/** Split a git header block into [key, value] pairs, folding continuation
+ * lines: a line starting with a space continues the previous header (the
+ * newline is kept, the leading space is stripped), as in multi-line `gpgsig`
+ * headers on signed commits. */
+function splitHeaders(header: string): Array<[string, string]> {
+  const pairs: Array<[string, string]> = [];
+  for (const line of header.split('\n')) {
+    if (line.startsWith(' ') && pairs.length > 0) {
+      const last = pairs[pairs.length - 1]!;
+      last[1] += `\n${line.slice(1)}`;
+      continue;
+    }
+    const space = line.indexOf(' ');
+    if (space <= 0) continue;
+    pairs.push([line.slice(0, space), line.slice(space + 1)]);
+  }
+  return pairs;
 }
 
 function parseCommit(data: Buffer): ParsedCommit {
@@ -134,14 +174,26 @@ function parseCommit(data: Buffer): ParsedCommit {
   const split = text.indexOf('\n\n');
   const header = split === -1 ? text : text.slice(0, split);
   const message = split === -1 ? '' : text.slice(split + 2);
-  const out: ParsedCommit = { tree: '', parents: [], author: '', committer: '', message };
-  for (const line of header.split('\n')) {
-    if (line.startsWith('tree ')) out.tree = line.slice(5).trim();
-    else if (line.startsWith('parent ')) out.parents.push(line.slice(7).trim());
-    else if (line.startsWith('author ')) out.author = line.slice(7);
-    else if (line.startsWith('committer ')) out.committer = line.slice(10);
+  const out: ParsedCommit = { tree: '', parents: [], author: '', committer: '', message, gpgsig: '' };
+  for (const [key, value] of splitHeaders(header)) {
+    if (key === 'tree') out.tree = value.trim();
+    else if (key === 'parent') out.parents.push(value.trim());
+    else if (key === 'author') out.author = value;
+    else if (key === 'committer') out.committer = value;
+    else if (key === 'gpgsig') out.gpgsig = value;
   }
   return out;
+}
+
+/** Unix seconds from a `Name <email> <ts> <tz>` ident line, or 0 when the
+ * line carries no parseable timestamp. Forge-made commits use 0; the kit
+ * client writes a fixed 1700000000, so a deepen-since cut is meaningful for
+ * pushed commits and honest (empty) for forge-made ones. */
+function identTime(ident: string): number {
+  const m = / (\d+) [+-]\d{4}$/.exec(ident);
+  if (m === null) return 0;
+  const t = Number.parseInt(m[1]!, 10);
+  return Number.isFinite(t) ? t : 0;
 }
 
 interface ParsedTag {
@@ -158,11 +210,11 @@ function parseTag(data: Buffer): ParsedTag {
   const header = split === -1 ? text : text.slice(0, split);
   const message = split === -1 ? '' : text.slice(split + 2);
   const out: ParsedTag = { object: '', type: '', tag: '', tagger: '', message };
-  for (const line of header.split('\n')) {
-    if (line.startsWith('object ')) out.object = line.slice(7).trim();
-    else if (line.startsWith('type ')) out.type = line.slice(5).trim();
-    else if (line.startsWith('tag ')) out.tag = line.slice(4);
-    else if (line.startsWith('tagger ')) out.tagger = line.slice(7);
+  for (const [key, value] of splitHeaders(header)) {
+    if (key === 'object') out.object = value.trim();
+    else if (key === 'type') out.type = value.trim();
+    else if (key === 'tag') out.tag = value;
+    else if (key === 'tagger') out.tagger = value;
   }
   return out;
 }
@@ -226,15 +278,7 @@ function deflatedOf(repo: RepoRec, oid: string, data: Buffer): Buffer {
 
 /** Store every blob/tree of a file map in the object store; returns the root tree oid. */
 function storeFileTree(repo: RepoRec, files: ReadonlyMap<string, FileRec>, prefix: string): string {
-  const direct = new Map<string, FileRec>();
-  const subdirs = new Set<string>();
-  for (const [path, file] of files) {
-    if (prefix !== '' && !path.startsWith(`${prefix}/`)) continue;
-    const rest = prefix === '' ? path : path.slice(prefix.length + 1);
-    const slash = rest.indexOf('/');
-    if (slash === -1) direct.set(rest, file);
-    else subdirs.add(rest.slice(0, slash));
-  }
+  const { direct, subdirs } = partitionFiles(files, prefix);
   const entries: TreeEntry[] = [];
   for (const [name, file] of direct) {
     putObject(repo, 'blob', file.content);
@@ -344,9 +388,10 @@ function syncCommitRecs(repo: RepoRec, tip: string): void {
     repo.commits.set(sha, {
       sha,
       message: parsed.message,
-      parent: parsed.parents[0] ?? null,
+      parents: parsed.parents,
       treeSha: parsed.tree,
       files: materializeFiles(repo, sha),
+      gpgsig: parsed.gpgsig,
     });
     for (const parent of parsed.parents) stack.push(parent);
   }
@@ -359,29 +404,14 @@ function syncBranchFromCommit(repo: RepoRec, branchName: string, tip: string): v
     branch = { name: branchName, tip: '', files: new Map(), history: [] };
     repo.branches.set(branchName, branch);
   }
-  const oldTip = branch.tip;
   branch.tip = tip;
   branch.files = materializeFiles(repo, tip);
-  if (oldTip !== '' && oldTip !== tip && isAncestor(repo, oldTip, tip)) {
-    // Fast-forward: only the commits between tip and oldTip are new. Walking
-    // them in ancestryOf's pre-order (stopping at oldTip) yields exactly the
-    // prefix ancestryOf(tip) has before oldTip, so prepending it to the old
-    // history reproduces ancestryOf(tip) without re-walking the whole history.
-    const fresh: string[] = [];
-    const seen = new Set<string>([oldTip]);
-    const visit = (oid: string): void => {
-      if (seen.has(oid)) return;
-      seen.add(oid);
-      const parsed = commitOf(repo, oid);
-      if (parsed === null) return;
-      fresh.push(oid);
-      for (const parent of parsed.parents) visit(parent);
-    };
-    visit(tip);
-    branch.history = [...fresh, ...branch.history];
-  } else {
-    branch.history = ancestryOf(repo, tip);
-  }
+  // Always re-walk: the old fast-forward shortcut prepended a walk that
+  // stopped at oldTip, which is only a prefix of ancestryOf(tip) for linear
+  // history. With a merge commit the walk visits the second parent's subtree
+  // before reaching oldTip on the first-parent chain, so the prepended order
+  // differed from ancestryOf(tip) ([M, C2, C1, C0] instead of [M, C1, C0, C2]).
+  branch.history = ancestryOf(repo, tip);
   syncCommitRecs(repo, tip);
 }
 
@@ -396,9 +426,11 @@ interface FileRec {
 interface CommitRec {
   sha: string;
   message: string;
-  parent: string | null;
+  parents: string[];
   treeSha: string;
   files: Map<string, FileRec>;
+  /** Multi-line `gpgsig` header value (continuations folded), '' when absent. */
+  gpgsig: string;
 }
 
 interface BranchRec {
@@ -484,13 +516,9 @@ let viewerLogin: string | null = null;
 function makeCommit(repo: RepoRec, branch: BranchRec, files: Map<string, FileRec>, message: string): CommitRec {
   const tree = storeFileTree(repo, files, '');
   const parent = branch.history.length > 0 ? branch.history[0]! : null;
-  const sha = commitSha(tree, parent, message);
-  putObject(
-    repo,
-    'commit',
-    commitBytes(tree, parent === null ? [] : [parent], 'Forge <forge@localhost> 0 +0000', 'Forge <forge@localhost> 0 +0000', message),
-  );
-  const commit: CommitRec = { sha, message, parent, treeSha: tree, files };
+  const { sha, bytes } = commitObject(tree, parent, message);
+  putObject(repo, 'commit', bytes);
+  const commit: CommitRec = { sha, message, parents: parent === null ? [] : [parent], treeSha: tree, files, gpgsig: '' };
   repo.commits.set(sha, commit);
   branch.tip = sha;
   branch.files = files;
@@ -530,13 +558,9 @@ function createRepo(name: string, isPrivate: boolean, description: string): Repo
   // Its objects live in the object store, but it is NOT a git ref: a fresh
   // repo has an unborn HEAD until the first push (clone-empty needs that).
   putObject(repo, 'tree', Buffer.alloc(0));
-  const sha = commitSha(EMPTY_TREE_SHA, null, 'Initial commit');
-  putObject(
-    repo,
-    'commit',
-    commitBytes(EMPTY_TREE_SHA, [], 'Forge <forge@localhost> 0 +0000', 'Forge <forge@localhost> 0 +0000', 'Initial commit'),
-  );
-  repo.commits.set(sha, { sha, message: 'Initial commit', parent: null, treeSha: EMPTY_TREE_SHA, files: new Map() });
+  const { sha, bytes } = commitObject(EMPTY_TREE_SHA, null, 'Initial commit');
+  putObject(repo, 'commit', bytes);
+  repo.commits.set(sha, { sha, message: 'Initial commit', parents: [], treeSha: EMPTY_TREE_SHA, files: new Map(), gpgsig: '' });
   branch.tip = sha;
   branch.history = [sha];
   reposByName.set(name, repo);
@@ -559,8 +583,40 @@ function ownerLoginOf(repo: RepoRec): string {
   return repo.ownerLogin ?? viewerLogin ?? '';
 }
 
+/** The token owner's login from every source the forge has: the login learned
+ * from the first owner-naming call, else any repo's recorded owner. Empty
+ * only while nothing has named an owner yet — the bearer token carries no
+ * login, so no identity can be invented before that. */
+/** A stable numeric user id derived from the login: the forge has no
+ * GitHub-assigned user ids, so the id is the first 32 bits of the SHA-1 of
+ * the login — positive, distinct per owner, stable across requests. Only
+ * the empty (unknown) login falls back to 1. */
+function ownerIdOf(login: string): number {
+  if (login === '') return 1;
+  return Number.parseInt(sha1(Buffer.from(login, 'utf8')).slice(0, 8), 16) || 1;
+}
+
+function viewerLoginOf(): string {
+  if (viewerLogin !== null) return viewerLogin;
+  for (const repo of reposByName.values()) {
+    if (repo.ownerLogin !== null && repo.ownerLogin !== '') return repo.ownerLogin;
+  }
+  return '';
+}
+
 // ---------------------------------------------------------------------------
 // pull requests (minimal store, shared by REST, MCP and GraphQL)
+
+/** A PR's head/base shas track their branches' current tips (GitHub
+ * semantics). The snapshot taken at creation (pull.headSha/pull.baseSha) is
+ * only a fallback for a branch that no longer exists. */
+function pullHeadSha(repo: RepoRec, pull: PullRec): string {
+  return repo.branches.get(pull.head)?.tip ?? pull.headSha;
+}
+
+function pullBaseSha(repo: RepoRec, pull: PullRec): string {
+  return repo.branches.get(pull.base)?.tip ?? pull.baseSha;
+}
 
 function pullJson(repo: RepoRec, pull: PullRec): Record<string, unknown> {
   const owner = ownerLoginOf(repo);
@@ -573,9 +629,9 @@ function pullJson(repo: RepoRec, pull: PullRec): Record<string, unknown> {
     merged: pull.merged,
     merged_at: pull.mergedAt,
     merge_commit_sha: pull.mergeCommitSha,
-    head: { ref: pull.head, label: `${owner}:${pull.head}`, sha: pull.headSha },
-    base: { ref: pull.base, label: `${owner}:${pull.base}`, sha: pull.baseSha },
-    user: { login: owner, id: 1, type: 'User' },
+    head: { ref: pull.head, label: `${owner}:${pull.head}`, sha: pullHeadSha(repo, pull) },
+    base: { ref: pull.base, label: `${owner}:${pull.base}`, sha: pullBaseSha(repo, pull) },
+    user: { login: owner, id: ownerIdOf(owner), type: 'User' },
     url: `/api/v3/repos/${owner}/${repo.name}/pulls/${pull.number}`,
     html_url: `https://example.invalid/${owner}/${repo.name}/pull/${pull.number}`,
     created_at: FIXED_DATE,
@@ -622,14 +678,38 @@ function createPull(
   return { pull };
 }
 
-/** The merge-base commit of two branches: the first commit of `head` also on `base`. */
+/** The merge-base commit of two branches: the best common ancestor — a
+ * common ancestor that no other common ancestor reaches. (First-common in
+ * pre-order is wrong once merges exist: if the base tip is itself the merge's
+ * second parent, the first common commit in pre-order is the *first* parent,
+ * not the base tip.) Criss-cross merges keep several best ancestors; the
+ * first in the head's pre-order wins, deterministically. */
 function mergeBaseSha(repo: RepoRec, head: string, base: string): string | null {
   const headBranch = repo.branches.get(head);
   const baseBranch = repo.branches.get(base);
   if (headBranch === undefined || baseBranch === undefined) return null;
-  const onBase = new Set(baseBranch.history);
-  for (const sha of headBranch.history) if (onBase.has(sha)) return sha;
-  return null;
+  const headAnc = ancestryOf(repo, headBranch.tip);
+  const onBase = new Set(ancestryOf(repo, baseBranch.tip));
+  const common = headAnc.filter((sha) => onBase.has(sha));
+  if (common.length === 0) return null;
+  const commonSet = new Set(common);
+  const dominated = new Set<string>();
+  for (const sha of common) {
+    const parsed = commitOf(repo, sha);
+    if (parsed === null) continue;
+    const stack = [...parsed.parents];
+    const seen = new Set<string>();
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      if (commonSet.has(oid)) dominated.add(oid);
+      const parentParsed = commitOf(repo, oid);
+      if (parentParsed !== null) for (const parent of parentParsed.parents) stack.push(parent);
+    }
+  }
+  for (const sha of common) if (!dominated.has(sha)) return sha;
+  return common[0] ?? null;
 }
 
 function filesOfCommit(repo: RepoRec, sha: string | null): Map<string, FileRec> {
@@ -652,7 +732,121 @@ function countLines(buf: Buffer): string[] {
   return lines;
 }
 
-/** Line-level diff counts between two file maps (multiset line comparison). */
+/** One line of a line-level diff: ' ' context, '-' removed, '+' added. */
+interface DiffLine {
+  kind: ' ' | '-' | '+';
+  line: string;
+}
+
+/** Line-level diff of two files (LCS on the differing middle, after trimming
+ * the common prefix/suffix). A moved line is a deletion + an addition — a
+ * multiset count would call it 0/0. Too big a middle degrades to "whole
+ * middle changed", which is still a valid edit script, just coarser. */
+function diffLines(oldLines: readonly string[], newLines: readonly string[]): DiffLine[] {
+  let prefix = 0;
+  while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) prefix += 1;
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+  const out: DiffLine[] = [];
+  for (let i = 0; i < prefix; i += 1) out.push({ kind: ' ', line: oldLines[i]! });
+  const oldMid = oldLines.slice(prefix, oldLines.length - suffix);
+  const newMid = newLines.slice(prefix, newLines.length - suffix);
+  if (oldMid.length * newMid.length > 250000) {
+    for (const line of oldMid) out.push({ kind: '-', line });
+    for (const line of newMid) out.push({ kind: '+', line });
+  } else {
+    const m = oldMid.length;
+    const n = newMid.length;
+    const table: number[][] = [];
+    for (let i = 0; i <= m; i += 1) table.push(new Array<number>(n + 1).fill(0));
+    for (let i = m - 1; i >= 0; i -= 1) {
+      for (let j = n - 1; j >= 0; j -= 1) {
+        table[i]![j] =
+          oldMid[i] === newMid[j] ? table[i + 1]![j + 1]! + 1 : Math.max(table[i + 1]![j]!, table[i]![j + 1]!);
+      }
+    }
+    let i = 0;
+    let j = 0;
+    while (i < m && j < n) {
+      if (oldMid[i] === newMid[j]) {
+        out.push({ kind: ' ', line: oldMid[i]! });
+        i += 1;
+        j += 1;
+      } else if (table[i + 1]![j]! >= table[i]![j + 1]!) {
+        out.push({ kind: '-', line: oldMid[i]! });
+        i += 1;
+      } else {
+        out.push({ kind: '+', line: newMid[j]! });
+        j += 1;
+      }
+    }
+    while (i < m) {
+      out.push({ kind: '-', line: oldMid[i]! });
+      i += 1;
+    }
+    while (j < n) {
+      out.push({ kind: '+', line: newMid[j]! });
+      j += 1;
+    }
+  }
+  for (let i = oldLines.length - suffix; i < oldLines.length; i += 1) out.push({ kind: ' ', line: oldLines[i]! });
+  return out;
+}
+
+/** A real unified diff for one file: `@@ -a,b +c,d @@` hunks with 3 lines of
+ * context, hunks merged when separated by 6 or fewer unchanged lines. */
+function unifiedPatch(filePath: string, oldLines: readonly string[], newLines: readonly string[]): string {
+  const ops = diffLines(oldLines, newLines);
+  const lines: string[] = [`--- a/${filePath}`, `+++ b/${filePath}`];
+  const CONTEXT = 3;
+  const changeIdx: number[] = [];
+  for (let k = 0; k < ops.length; k += 1) if (ops[k]!.kind !== ' ') changeIdx.push(k);
+  if (changeIdx.length === 0) return lines.join('\n');
+  const hunks: Array<[number, number]> = [];
+  let start = Math.max(0, changeIdx[0]! - CONTEXT);
+  let end = Math.min(ops.length, changeIdx[0]! + CONTEXT + 1);
+  for (const idx of changeIdx.slice(1)) {
+    const s = Math.max(0, idx - CONTEXT);
+    const e = Math.min(ops.length, idx + CONTEXT + 1);
+    if (s <= end) end = Math.max(end, e);
+    else {
+      hunks.push([start, end]);
+      start = s;
+      end = e;
+    }
+  }
+  hunks.push([start, end]);
+  for (const [hs, he] of hunks) {
+    let oldBefore = 0;
+    let newBefore = 0;
+    for (let k = 0; k < hs; k += 1) {
+      if (ops[k]!.kind !== '+') oldBefore += 1;
+      if (ops[k]!.kind !== '-') newBefore += 1;
+    }
+    let oldCount = 0;
+    let newCount = 0;
+    for (let k = hs; k < he; k += 1) {
+      if (ops[k]!.kind !== '+') oldCount += 1;
+      if (ops[k]!.kind !== '-') newCount += 1;
+    }
+    // A pure insertion/deletion starts at the line before the hunk.
+    const oldStart = oldCount === 0 ? oldBefore : oldBefore + 1;
+    const newStart = newCount === 0 ? newBefore : newBefore + 1;
+    const fmt = (startNo: number, count: number): string => (count === 1 ? `${startNo}` : `${startNo},${count}`);
+    lines.push(`@@ -${fmt(oldStart, oldCount)} +${fmt(newStart, newCount)} @@`);
+    for (let k = hs; k < he; k += 1) lines.push(`${ops[k]!.kind}${ops[k]!.line}`);
+  }
+  return lines.join('\n');
+}
+
+/** Line-level diff counts between two file maps (from the real diff, so a
+ * moved line counts as 1 addition + 1 deletion). */
 function changedFiles(from: ReadonlyMap<string, FileRec>, to: ReadonlyMap<string, FileRec>): ChangedFile[] {
   const out: ChangedFile[] = [];
   const paths = new Set([...from.keys(), ...to.keys()]);
@@ -664,18 +858,13 @@ function changedFiles(from: ReadonlyMap<string, FileRec>, to: ReadonlyMap<string
     } else if (oldFile !== undefined && newFile === undefined) {
       out.push({ path, status: 'removed', additions: 0, deletions: countLines(oldFile.content).length });
     } else if (oldFile !== undefined && newFile !== undefined && oldFile.sha !== newFile.sha) {
-      const oldLines = countLines(oldFile.content);
-      const newLines = countLines(newFile.content);
-      const oldCount = new Map<string, number>();
-      for (const line of oldLines) oldCount.set(line, (oldCount.get(line) ?? 0) + 1);
+      const ops = diffLines(countLines(oldFile.content), countLines(newFile.content));
       let additions = 0;
-      for (const line of newLines) {
-        const left = oldCount.get(line) ?? 0;
-        if (left > 0) oldCount.set(line, left - 1);
-        else additions += 1;
-      }
       let deletions = 0;
-      for (const left of oldCount.values()) deletions += left;
+      for (const op of ops) {
+        if (op.kind === '+') additions += 1;
+        else if (op.kind === '-') deletions += 1;
+      }
       out.push({ path, status: 'modified', additions, deletions });
     }
   }
@@ -733,6 +922,14 @@ function mergePull(repo: RepoRec, pull: PullRec): { sha: string } | { error: str
 // ---------------------------------------------------------------------------
 // HTTP plumbing
 
+/** GitHub wraps base64 content at 60 columns. */
+function base64Wrapped(data: Buffer): string {
+  const b64 = data.toString('base64');
+  const lines: string[] = [];
+  for (let i = 0; i < b64.length; i += 60) lines.push(b64.slice(i, i + 60));
+  return lines.join('\n');
+}
+
 function sendJson(
   res: ServerResponse,
   status: number,
@@ -767,6 +964,11 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     req.on('data', (chunk: Buffer) => {
       total += chunk.length;
       if (total > 16 * 1024 * 1024) {
+        // Stop consuming the rest of the body: the socket must not stay
+        // busy for the remainder of an oversized upload. The stream itself
+        // is destroyed once the 400 below has flushed (see createApp).
+        req.removeAllListeners('data');
+        req.pause();
         reject(new Error('body too large'));
         return;
       }
@@ -855,6 +1057,28 @@ function paginate<T>(items: readonly T[], perPage: number, page: number): { slic
   return { slice: items.slice(start, start + perPage), hasNext: start + perPage < items.length };
 }
 
+/** A GitHub-style `Link` header for a paginated list: `next` and `last`,
+ * preserving the caller's query parameters. Empty when this is the last
+ * page, matching the /user/repos handler. */
+function pageLinkHeader(
+  req: IncomingMessage,
+  base: string,
+  query: URLSearchParams,
+  total: number,
+  perPage: number,
+  page: number,
+): Record<string, string> {
+  const lastPage = Math.max(1, Math.ceil(total / perPage));
+  if (page * perPage >= total) return {};
+  const urlFor = (p: number): string => {
+    const q = new URLSearchParams(query);
+    q.set('per_page', String(perPage));
+    q.set('page', String(p));
+    return `${originOf(req)}${base}?${q.toString()}`;
+  };
+  return { link: `<${urlFor(page + 1)}>; rel="next", <${urlFor(lastPage)}>; rel="last"` };
+}
+
 // ---------------------------------------------------------------------------
 // JSON shapes
 
@@ -864,7 +1088,7 @@ function repoJson(repo: RepoRec): Record<string, unknown> {
     id: repo.id,
     name: repo.name,
     full_name: `${owner}/${repo.name}`,
-    owner: { login: owner, id: 1, type: 'User' },
+    owner: { login: owner, id: ownerIdOf(owner), type: 'User' },
     private: repo.isPrivate,
     description: repo.description,
     default_branch: repo.defaultBranch,
@@ -892,7 +1116,7 @@ function issueJson(repo: RepoRec, issue: IssueRec): Record<string, unknown> {
     state: issue.state,
     labels: issue.labels.map((label) => ({ name: label.name, color: label.color })),
     comments: issue.comments.length,
-    user: { login: owner, id: 1, type: 'User' },
+    user: { login: owner, id: ownerIdOf(owner), type: 'User' },
     url: `/api/v3/repos/${owner}/${repo.name}/issues/${issue.number}`,
     html_url: `https://example.invalid/${owner}/${repo.name}/issues/${issue.number}`,
     created_at: FIXED_DATE,
@@ -907,13 +1131,28 @@ function commitJson(commit: CommitRec): Record<string, unknown> {
       message: commit.message,
       author: { name: 'Forge', email: 'forge@localhost', date: FIXED_DATE },
       committer: { name: 'Forge', email: 'forge@localhost', date: FIXED_DATE },
+      // Only present on signed commits, so unsigned responses are unchanged.
+      ...(commit.gpgsig !== '' ? { gpgsig: commit.gpgsig } : {}),
     },
-    parents: commit.parent === null ? [] : [{ sha: commit.parent }],
+    parents: commit.parents.map((sha) => ({ sha })),
   };
 }
 
 function branchJson(branch: BranchRec): Record<string, unknown> {
   return { name: branch.name, commit: { sha: branch.tip }, protected: false };
+}
+
+/** One entry of GET /git/refs, shared with the single-ref lookups. */
+function gitRefEntry(repo: RepoRec, owner: string, ref: string, sha: string): Record<string, unknown> {
+  const type = repo.objects.get(sha)?.type ?? 'commit';
+  return {
+    ref,
+    object: {
+      sha,
+      type,
+      url: `/api/v3/repos/${owner}/${repo.name}/git/${type === 'tag' ? 'tags' : 'commits'}/${sha}`,
+    },
+  };
 }
 
 /** Resolve a ref (branch name, else commit sha) to the files at that point. */
@@ -928,24 +1167,27 @@ function filesAtRef(repo: RepoRec, ref: string | null): Map<string, FileRec> | n
 
 function directoryListing(repo: RepoRec, files: ReadonlyMap<string, FileRec>, dir: string): Record<string, unknown>[] {
   const prefix = dir === '' ? '' : `${dir}/`;
-  const fileEntries = new Map<string, FileRec>();
-  const subdirs = new Set<string>();
-  for (const [path, file] of files) {
-    if (!path.startsWith(prefix)) continue;
-    const rest = path.slice(prefix.length);
-    const slash = rest.indexOf('/');
-    if (slash === -1) fileEntries.set(rest, file);
-    else subdirs.add(rest.slice(0, slash));
-  }
-  const out: Record<string, unknown>[] = [];
-  for (const [name, file] of [...fileEntries.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
-    out.push({ type: 'file', name, path: `${prefix}${name}`, sha: file.sha, size: file.content.length });
-  }
-  for (const name of [...subdirs].sort()) {
+  const { direct: fileEntries, subdirs } = partitionFiles(files, dir);
+  // GitHub's contents listing interleaves entries in git tree order (a
+  // directory compares as if its name ended in '/'), not dirs-first.
+  const entries: Array<{ name: string; mode: string; entry: Record<string, unknown> }> = [];
+  for (const name of subdirs) {
     const subPrefix = `${prefix}${name}`;
-    out.push({ type: 'dir', name, path: subPrefix, sha: treeShaForFiles(files, subPrefix) });
+    entries.push({
+      name,
+      mode: '40000',
+      entry: { type: 'dir', name, path: subPrefix, sha: treeShaForFiles(files, subPrefix) },
+    });
   }
-  return out;
+  for (const [name, file] of fileEntries.entries()) {
+    entries.push({
+      name,
+      mode: '100644',
+      entry: { type: 'file', name, path: `${prefix}${name}`, sha: file.sha, size: file.content.length },
+    });
+  }
+  entries.sort((a, b) => compareGitTreeNames(a, b));
+  return entries.map((e) => e.entry);
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,8 +1266,16 @@ interface McpToolDef {
   description: string;
   properties: Record<string, Record<string, unknown>>;
   required: string[];
+  /** Synonym names the tool already accepts (via mcpArg/mcpNum) for a required
+   * argument. The missing-argument check honours them, so a call that passes
+   * a required argument only under a synonym is not rejected. */
+  aliases?: Record<string, readonly string[]>;
   run: (args: Record<string, unknown>) => McpToolOutcome;
 }
+
+/** Synonyms shared by every repo-scoped tool (see resolveMcpRepo). */
+const MCP_OWNER_ALIASES = ['owner_login', 'login'] as const;
+const MCP_REPO_ALIASES = ['repository', 'repo_name'] as const;
 
 function resolveMcpRepo(args: Record<string, unknown>): { repo: RepoRec } | { error: string } {
   const owner = mcpArg(args, ['owner', 'owner_login', 'login']);
@@ -1048,6 +1298,7 @@ const MCP_TOOLS: readonly McpToolDef[] = [
       owner: { type: 'string', description: 'The owner login (defaults to the token owner).' },
     },
     required: ['name'],
+    aliases: { name: ['repo', 'repository'] },
     run: (args) => {
       const name = mcpArg(args, ['name', 'repo', 'repository']);
       if (name === '') return { ok: false, message: 'name is required' };
@@ -1065,6 +1316,7 @@ const MCP_TOOLS: readonly McpToolDef[] = [
       repo: { type: 'string', description: 'The repository name.' },
     },
     required: ['owner', 'repo'],
+    aliases: { owner: MCP_OWNER_ALIASES, repo: MCP_REPO_ALIASES },
     run: (args) => {
       const resolved = resolveMcpRepo(args);
       if ('error' in resolved) return { ok: false, message: resolved.error };
@@ -1081,6 +1333,7 @@ const MCP_TOOLS: readonly McpToolDef[] = [
       body: { type: 'string', description: 'The issue body.' },
     },
     required: ['owner', 'repo', 'title'],
+    aliases: { owner: MCP_OWNER_ALIASES, repo: MCP_REPO_ALIASES, title: ['issue_title'] },
     run: (args) => {
       const resolved = resolveMcpRepo(args);
       if ('error' in resolved) return { ok: false, message: resolved.error };
@@ -1099,6 +1352,7 @@ const MCP_TOOLS: readonly McpToolDef[] = [
       state: { type: 'string', description: 'Issue state filter: open, closed or all.' },
     },
     required: ['owner', 'repo'],
+    aliases: { owner: MCP_OWNER_ALIASES, repo: MCP_REPO_ALIASES },
     run: (args) => {
       const resolved = resolveMcpRepo(args);
       if ('error' in resolved) return { ok: false, message: resolved.error };
@@ -1122,6 +1376,13 @@ const MCP_TOOLS: readonly McpToolDef[] = [
       base: { type: 'string', description: 'The base branch name.' },
     },
     required: ['owner', 'repo', 'title', 'head', 'base'],
+    aliases: {
+      owner: MCP_OWNER_ALIASES,
+      repo: MCP_REPO_ALIASES,
+      title: ['pr_title'],
+      head: ['head_ref', 'head_branch'],
+      base: ['base_ref', 'base_branch'],
+    },
     run: (args) => {
       const resolved = resolveMcpRepo(args);
       if ('error' in resolved) return { ok: false, message: resolved.error };
@@ -1147,6 +1408,11 @@ const MCP_TOOLS: readonly McpToolDef[] = [
       pull_number: { type: 'integer', description: 'The pull request number.' },
     },
     required: ['owner', 'repo', 'pull_number'],
+    aliases: {
+      owner: MCP_OWNER_ALIASES,
+      repo: MCP_REPO_ALIASES,
+      pull_number: ['pull_request_number', 'pr_number', 'number'],
+    },
     run: (args) => {
       const resolved = resolveMcpRepo(args);
       if ('error' in resolved) return { ok: false, message: resolved.error };
@@ -1259,8 +1525,13 @@ function handleMcp(req: IncomingMessage, res: ServerResponse, raw: Buffer): void
       }
       const args = asObject(params.arguments) ?? {};
       const missing = tool.required.filter((key) => {
-        const value = args[key];
-        return value === undefined || value === null || (typeof value === 'string' && value === '');
+        // A required argument counts as present under its canonical name or
+        // any of the synonyms the tool itself accepts (P2-14).
+        const names = [key, ...(tool.aliases?.[key] ?? [])];
+        return !names.some((name) => {
+          const value = args[name];
+          return value !== undefined && value !== null && !(typeof value === 'string' && value === '');
+        });
       });
       if (missing.length > 0) {
         rpcError(res, 200, id, -32602, `Missing required argument(s): ${missing.join(', ')}`);
@@ -1340,6 +1611,28 @@ type GqlToken =
   | { kind: 'punct'; value: string }
   | { kind: 'spread'; value: string };
 
+/** The value of a GraphQL block string: strip the leading/trailing blank
+ * lines, then the common indentation of every line after the first. */
+function blockStringValue(raw: string): string {
+  const text = raw.replace(/\\"""/g, '"""');
+  const lines = text.split(/\r\n|[\r\n]/);
+  let start = 0;
+  let end = lines.length;
+  while (start < end && lines[start]!.trim() === '') start += 1;
+  while (end > start && lines[end - 1]!.trim() === '') end -= 1;
+  const body = lines.slice(start, end);
+  let indent: number | null = null;
+  for (let k = 1; k < body.length; k += 1) {
+    const line = body[k]!;
+    if (line.trim() === '') continue;
+    const match = /^ */.exec(line);
+    const n = match === null ? 0 : match[0].length;
+    indent = indent === null ? n : Math.min(indent, n);
+  }
+  const cut = indent ?? 0;
+  return body.map((line, k) => (k === 0 ? line : line.slice(cut))).join('\n');
+}
+
 function gqlTokenize(src: string): GqlToken[] | null {
   const tokens: GqlToken[] = [];
   let i = 0;
@@ -1364,6 +1657,26 @@ function gqlTokenize(src: string): GqlToken[] | null {
       continue;
     }
     if (ch === '"') {
+      // Block string: """...""" (only \"\"\" is an escape inside it).
+      if (src.startsWith('"""', i)) {
+        let j = i + 3;
+        let closed = false;
+        while (j < src.length) {
+          if (src[j] === '\\' && src.startsWith('"""', j + 1)) {
+            j += 4;
+            continue;
+          }
+          if (src.startsWith('"""', j)) {
+            closed = true;
+            break;
+          }
+          j += 1;
+        }
+        if (!closed) return null;
+        tokens.push({ kind: 'string', value: blockStringValue(src.slice(i + 3, j)) });
+        i = j + 3;
+        continue;
+      }
       let j = i + 1;
       let out = '';
       let closed = false;
@@ -1371,7 +1684,27 @@ function gqlTokenize(src: string): GqlToken[] | null {
         const c = src[j]!;
         if (c === '\\' && j + 1 < src.length) {
           const esc = src[j + 1]!;
-          out += esc === 'n' ? '\n' : esc === 't' ? '\t' : esc === 'r' ? '\r' : esc;
+          if (esc === 'u') {
+            const hex = src.slice(j + 2, j + 6);
+            if (!/^[0-9a-fA-F]{4}$/.test(hex)) return null;
+            let code = Number.parseInt(hex, 16);
+            j += 6;
+            // A high surrogate followed by \uXXXX low surrogate is one code point.
+            if (code >= 0xd800 && code <= 0xdbff && src[j] === '\\' && src[j + 1] === 'u') {
+              const hex2 = src.slice(j + 2, j + 6);
+              if (/^[0-9a-fA-F]{4}$/.test(hex2)) {
+                const low = Number.parseInt(hex2, 16);
+                if (low >= 0xdc00 && low <= 0xdfff) {
+                  code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                  j += 6;
+                }
+              }
+            }
+            out += String.fromCodePoint(code);
+            continue;
+          }
+          out +=
+            esc === 'n' ? '\n' : esc === 't' ? '\t' : esc === 'r' ? '\r' : esc === 'b' ? '\b' : esc === 'f' ? '\f' : esc;
           j += 2;
           continue;
         }
@@ -1391,6 +1724,15 @@ function gqlTokenize(src: string): GqlToken[] | null {
       let j = i;
       if (src[j] === '-') j += 1;
       while (j < src.length && /[0-9.]/.test(src[j]!)) j += 1;
+      // Float exponent: 1e3, 1.5E-3 (only when a valid exponent follows).
+      if (src[j] === 'e' || src[j] === 'E') {
+        let k = j + 1;
+        if (src[k] === '+' || src[k] === '-') k += 1;
+        if (/[0-9]/.test(src[k] ?? '')) {
+          while (k < src.length && /[0-9]/.test(src[k]!)) k += 1;
+          j = k;
+        }
+      }
       tokens.push({ kind: 'int', value: src.slice(i, j) });
       i = j;
       continue;
@@ -1428,6 +1770,9 @@ interface GqlFieldSel {
 interface GqlFragmentSel {
   kind: 'fragment';
   typeCondition: string | null;
+  /** Named spread (`...Name`); null for inline fragments. Resolved to the
+   * fragment's type condition and selections after the document is parsed. */
+  name: string | null;
   selections: GqlSelection[];
 }
 type GqlSelection = GqlFieldSel | GqlFragmentSel;
@@ -1442,6 +1787,7 @@ interface GqlOperation {
 class GqlParser {
   private pos = 0;
   private readonly tokens: GqlToken[];
+  private readonly fragments = new Map<string, { typeCondition: string; selections: GqlSelection[] }>();
   constructor(tokens: GqlToken[]) {
     this.tokens = tokens;
   }
@@ -1471,11 +1817,55 @@ class GqlParser {
   parseDocument(): GqlOperation[] | null {
     const ops: GqlOperation[] = [];
     while (this.pos < this.tokens.length) {
+      const first = this.peek();
+      if (first !== undefined && first.kind === 'name' && first.value === 'fragment') {
+        if (!this.parseFragmentDefinition()) return null;
+        continue;
+      }
       const op = this.parseOperation();
       if (op === null) return null;
       ops.push(op);
     }
+    // Resolve named spreads now that every definition has been seen
+    // (definitions may follow their uses). A spread of an unknown fragment
+    // or a fragment cycle fails the whole document.
+    for (const op of ops) {
+      if (!this.expandFragments(op.selections, new Set())) return null;
+    }
     return ops;
+  }
+
+  private parseFragmentDefinition(): boolean {
+    this.pos += 1; // 'fragment'
+    const name = this.expectName();
+    if (name === null) return false;
+    if (this.expectName() !== 'on') return false;
+    const typeCondition = this.expectName();
+    if (typeCondition === null) return false;
+    const selections = this.parseSelectionSet();
+    if (selections === null) return false;
+    this.fragments.set(name, { typeCondition, selections });
+    return true;
+  }
+
+  private expandFragments(selections: GqlSelection[], visiting: Set<string>): boolean {
+    for (let i = 0; i < selections.length; i += 1) {
+      const sel = selections[i]!;
+      if (sel.kind === 'fragment' && sel.name !== null) {
+        const frag = this.fragments.get(sel.name);
+        if (frag === undefined) return false;
+        if (visiting.has(sel.name)) return false;
+        visiting.add(sel.name);
+        if (!this.expandFragments(frag.selections, visiting)) return false;
+        visiting.delete(sel.name);
+        selections[i] = { kind: 'fragment', typeCondition: frag.typeCondition, name: null, selections: frag.selections };
+      } else if (sel.kind === 'fragment') {
+        if (!this.expandFragments(sel.selections, visiting)) return false;
+      } else {
+        if (!this.expandFragments(sel.selections, visiting)) return false;
+      }
+    }
+    return true;
   }
 
   private parseOperation(): GqlOperation | null {
@@ -1484,14 +1874,6 @@ class GqlParser {
     if (first !== undefined && first.kind === 'name' && (first.value === 'query' || first.value === 'mutation')) {
       kind = first.value;
       this.pos += 1;
-    } else if (first !== undefined && first.kind === 'name' && first.value === 'fragment') {
-      // Fragment definition: skip it (the suite uses inline fragments only).
-      this.pos += 1;
-      if (this.expectName() === null) return null;
-      if (this.expectName() !== 'on') return null;
-      if (this.expectName() === null) return null;
-      if (this.parseSelectionSet() === null) return null;
-      return { kind: 'query', name: null, varDefaults: {}, selections: [] };
     }
     let name: string | null = null;
     const maybeName = this.peek();
@@ -1543,16 +1925,19 @@ class GqlParser {
     if (t === undefined) return null;
     if (t.kind === 'spread') {
       this.pos += 1;
-      let typeCondition: string | null = null;
       const on = this.peek();
       if (on !== undefined && on.kind === 'name' && on.value === 'on') {
         this.pos += 1;
-        typeCondition = this.expectName();
+        const typeCondition = this.expectName();
         if (typeCondition === null) return null;
+        const selections = this.parseSelectionSet();
+        if (selections === null) return null;
+        return { kind: 'fragment', typeCondition, name: null, selections };
       }
-      const selections = this.parseSelectionSet();
-      if (selections === null) return null;
-      return { kind: 'fragment', typeCondition, selections };
+      // Named spread: resolved against the fragment table after parsing.
+      const fragName = this.expectName();
+      if (fragName === null) return null;
+      return { kind: 'fragment', typeCondition: null, name: fragName, selections: [] };
     }
     const first = this.expectName();
     if (first === null) return null;
@@ -1675,12 +2060,12 @@ type GqlParent =
   | { type: 'Issue'; repo: RepoRec; issue: IssueRec }
   | { type: 'User'; login: string }
   | { type: 'Ref'; name: string }
-  | { type: 'IssueConnection'; repo: RepoRec; issues: IssueRec[]; hasNext: boolean; endCursor: string | null }
+  | { type: 'IssueConnection'; repo: RepoRec; issues: IssueRec[]; hasNext: boolean; endCursor: string | null; total: number }
   | { type: 'PageInfo'; hasNext: boolean; endCursor: string | null }
   | { type: 'PullRequest'; repo: RepoRec; pull: PullRec }
   | { type: 'PullRequestConnection'; repo: RepoRec; pulls: PullRec[] }
   | { type: 'ChangedFile'; file: ChangedFile }
-  | { type: 'ChangedFileConnection'; files: ChangedFile[] }
+  | { type: 'ChangedFileConnection'; files: ChangedFile[]; total: number }
   | { type: '__Type'; name: string }
   | { type: 'CreateIssuePayload'; repo: RepoRec; issue: IssueRec }
   | { type: 'CloseIssuePayload'; repo: RepoRec; issue: IssueRec }
@@ -1772,6 +2157,28 @@ function pullFromGlobalId(id: string): { repo: RepoRec; pull: PullRec } | null {
   return pull === undefined ? null : { repo: resolved, pull };
 }
 
+function commentFromGlobalId(id: string): { repo: RepoRec; issue: IssueRec; comment: CommentRec } | null {
+  const decoded = ungid(id);
+  if (decoded === null || decoded.kind !== 'IssueComment') return null;
+  const hash = decoded.key.lastIndexOf('#');
+  if (hash <= 0) return null;
+  const repoPart = decoded.key.slice(0, hash);
+  const rest = decoded.key.slice(hash + 1);
+  const marker = '/comment/';
+  const markerAt = rest.lastIndexOf(marker);
+  if (markerAt <= 0) return null;
+  const number = Number.parseInt(rest.slice(0, markerAt), 10);
+  const commentId = Number.parseInt(rest.slice(markerAt + marker.length), 10);
+  const slash = repoPart.lastIndexOf('/');
+  if (slash <= 0 || !Number.isFinite(number) || !Number.isFinite(commentId)) return null;
+  const resolved = resolveRepo(repoPart.slice(0, slash), repoPart.slice(slash + 1));
+  if (resolved === null || resolved === 'foreign') return null;
+  const issue = resolved.issues.get(number);
+  if (issue === undefined) return null;
+  const comment = issue.comments.find((c) => c.id === commentId);
+  return comment === undefined ? null : { repo: resolved, issue, comment };
+}
+
 function issueStateGql(issue: IssueRec): string {
   return issue.state === 'open' ? 'OPEN' : 'CLOSED';
 }
@@ -1792,7 +2199,7 @@ function resolveGqlField(
   const vars = ctx.variables;
   switch (parent.type) {
     case 'Query': {
-      if (name === 'viewer') return { value: { type: 'User', login: viewerLogin ?? '' } as GqlParent };
+      if (name === 'viewer') return { value: { type: 'User', login: viewerLoginOf() } as GqlParent };
       if (name === 'repository') {
         const owner = gqlArgStr(args, 'owner', vars);
         const repoName = gqlArgStr(args, 'name', vars);
@@ -1815,6 +2222,10 @@ function resolveGqlField(
         if (decoded.kind === 'PullRequest') {
           const found = pullFromGlobalId(id);
           return { value: found === null ? null : ({ type: 'PullRequest', repo: found.repo, pull: found.pull } as GqlParent) };
+        }
+        if (decoded.kind === 'IssueComment') {
+          const found = commentFromGlobalId(id);
+          return { value: found === null ? null : ({ type: 'Comment', repo: found.repo, issue: found.issue, comment: found.comment } as GqlParent) };
         }
         return { value: null };
       }
@@ -1897,7 +2308,12 @@ function resolveGqlField(
       if (name === 'nameWithOwner') return { value: `${owner}/${repo.name}` };
       if (name === 'owner') return { value: { type: 'User', login: owner } as GqlParent };
       if (name === 'defaultBranchRef') return { value: { type: 'Ref', name: repo.defaultBranch } as GqlParent };
-      if (name === 'viewerPermission') return { value: 'ADMIN' };
+      if (name === 'viewerPermission') {
+        // The viewer is the repo owner (or the forge's sole operator while
+        // no login is known yet) — ADMIN; any other named viewer only reads.
+        const viewer = viewerLoginOf();
+        return { value: viewer !== '' && viewer !== owner ? 'READ' : 'ADMIN' };
+      }
       if (name === 'hasIssuesEnabled') return { value: true };
       if (name === 'description') return { value: repo.description };
       if (name === 'url') return { value: `https://example.invalid/${owner}/${repo.name}` };
@@ -1923,7 +2339,9 @@ function resolveGqlField(
         }
         const direction = orderBy !== null && orderBy.direction === 'ASC' ? 1 : orderBy !== null && orderBy.direction === 'DESC' ? -1 : 1;
         const hasOrder = orderBy !== null && typeof orderBy.field === 'string';
-        list.sort((a, b) => (hasOrder ? (a.seq - b.seq) * direction : a.seq - b.seq));
+        // No orderBy: GitHub's default is CREATED_AT DESC (newest first), same
+        // as this forge's own REST list_issues.
+        list.sort((a, b) => (hasOrder ? (a.seq - b.seq) * direction : b.seq - a.seq));
         let start = 0;
         if (typeof after === 'string' && after !== '') {
           const afterNumber = numberFromCursor(after);
@@ -1936,11 +2354,24 @@ function resolveGqlField(
         const page = list.slice(start, start + limit);
         const hasNext = start + page.length < list.length;
         const endCursor = page.length === 0 ? null : cursorFor(page[page.length - 1]!.number);
-        return { value: { type: 'IssueConnection', repo, issues: page, hasNext, endCursor } as GqlParent };
+        return { value: { type: 'IssueConnection', repo, issues: page, hasNext, endCursor, total: list.length } as GqlParent };
       }
       if (name === 'pullRequests') {
         const first = gqlArgInt(args, 'first', vars);
-        let list = [...repo.pulls.values()].filter((pull) => pull.state === 'open');
+        const states = gqlArg(args, 'states', vars);
+        let list = [...repo.pulls.values()];
+        if (Array.isArray(states) && states.length > 0) {
+          // Same shape as the sibling issues resolver: honour the states
+          // argument (OPEN/CLOSED/MERGED) when given. A merged PR is closed
+          // at the REST level (state 'closed'), so CLOSED matches it too,
+          // while MERGED matches merged PRs specifically.
+          const wanted = new Set(states.map((s) => (typeof s === 'string' ? s : '')));
+          list = list.filter(
+            (pull) => wanted.has(pullStateGql(pull)) || (wanted.has('CLOSED') && pull.state === 'closed'),
+          );
+        } else {
+          list = list.filter((pull) => pull.state === 'open');
+        }
         list.sort((a, b) => b.seq - a.seq);
         if (first !== null) list = list.slice(0, first);
         return { value: { type: 'PullRequestConnection', repo, pulls: list } as GqlParent };
@@ -1967,6 +2398,10 @@ function resolveGqlField(
       if (name === 'author') return { value: { type: 'User', login: ownerLoginOf(repo) } as GqlParent };
       if (name === 'labels') return { value: { nodes: issue.labels.map((l) => ({ name: l.name })) } };
       if (name === 'comments') return { value: { nodes: issue.comments.map((c) => ({ id: c.id, body: c.body })) } };
+      // The forge stores no assignees and no milestones: an empty connection
+      // and null, so the advertised fields resolve instead of erroring.
+      if (name === 'assignees') return { value: { nodes: [], totalCount: 0 } };
+      if (name === 'milestone') return { value: null };
       return { missing: true };
     }
     case 'User': {
@@ -1987,7 +2422,7 @@ function resolveGqlField(
       if (name === 'pageInfo') {
         return { value: { type: 'PageInfo', hasNext: parent.hasNext, endCursor: parent.endCursor } as GqlParent };
       }
-      if (name === 'totalCount') return { value: parent.issues.length };
+      if (name === 'totalCount') return { value: parent.total };
       return { missing: true };
     }
     case 'PageInfo': {
@@ -2010,16 +2445,17 @@ function resolveGqlField(
       if (name === 'mergeable') return { value: mergeableOf(repo, pull) };
       if (name === 'headRefName') return { value: pull.head };
       if (name === 'baseRefName') return { value: pull.base };
-      if (name === 'headRefOid') return { value: pull.headSha };
-      if (name === 'baseRefOid') return { value: pull.baseSha };
+      if (name === 'headRefOid') return { value: pullHeadSha(repo, pull) };
+      if (name === 'baseRefOid') return { value: pullBaseSha(repo, pull) };
       if (name === 'url') return { value: `https://example.invalid/${ownerLoginOf(repo)}/${repo.name}/pull/${pull.number}` };
       if (name === 'createdAt' || name === 'updatedAt') return { value: FIXED_DATE };
       if (name === 'author') return { value: { type: 'User', login: ownerLoginOf(repo) } as GqlParent };
       if (name === 'files') {
         const first = gqlArgInt(args, 'first', vars);
-        let files = prChangedFiles(repo, pull);
+        const all = prChangedFiles(repo, pull);
+        let files = all;
         if (first !== null) files = files.slice(0, first);
-        return { value: { type: 'ChangedFileConnection', files } as GqlParent };
+        return { value: { type: 'ChangedFileConnection', files, total: all.length } as GqlParent };
       }
       return { missing: true };
     }
@@ -2027,7 +2463,7 @@ function resolveGqlField(
       if (name === 'nodes') {
         return { value: parent.files.map((file) => ({ type: 'ChangedFile', file }) as GqlParent) };
       }
-      if (name === 'totalCount') return { value: parent.files.length };
+      if (name === 'totalCount') return { value: parent.total };
       return { missing: true };
     }
     case 'PullRequestConnection': {
@@ -2100,7 +2536,10 @@ function executeGqlSelections(
   const out: Record<string, unknown> = {};
   for (const selection of selections) {
     if (selection.kind === 'fragment') {
-      if (selection.typeCondition !== null && selection.typeCondition !== parent.type) continue;
+      // The GraphQL type is IssueComment; the executor's internal parent
+      // type for it is Comment.
+      const condition = selection.typeCondition === 'IssueComment' ? 'Comment' : selection.typeCondition;
+      if (condition !== null && condition !== parent.type) continue;
       Object.assign(out, executeGqlSelections(selection.selections, parent, ctx));
       continue;
     }
@@ -2344,6 +2783,13 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   if (sourceSize !== base.length) {
     throw new Error(`delta expects a ${sourceSize}-byte base, got ${base.length}`);
   }
+  // Never allocate the declared target size blindly: a corrupt delta could
+  // claim gigabytes and OOM the process before the bounds checks run. No
+  // object the forge can legitimately hold exceeds the 16 MiB request-body
+  // cap, so that is the bound.
+  if (!Number.isSafeInteger(targetSize) || targetSize > 16 * 1024 * 1024) {
+    throw new Error('delta target size exceeds the 16 MiB object cap');
+  }
   const out = Buffer.allocUnsafe(targetSize);
   let written = 0;
   while (offset < delta.length) {
@@ -2537,10 +2983,40 @@ function readPackObjects(pack: Buffer, repo: RepoRec): Map<string, GitObject> {
     resolving.delete(entry.offset);
     return out;
   };
-  for (const entry of raw) {
-    const r = resolve(entry, 0);
-    if (!objects.has(r.oid)) objects.set(r.oid, { type: r.type, data: r.data });
+  // Resolve in passes: a REF_DELTA may name a base that appears later in the
+  // pack, so a first attempt can fail with "ref-delta base … is neither in
+  // the pack nor in the store" only because the base has not been resolved
+  // yet. Defer exactly that failure and retry after the other entries have
+  // resolved; any other failure (bad delta, cycle, depth) still throws at
+  // once, and a pack whose base is genuinely missing still fails once no
+  // pass makes progress.
+  const pending = [...raw];
+  let progress = true;
+  while (pending.length > 0 && progress) {
+    progress = false;
+    for (let i = pending.length - 1; i >= 0; i -= 1) {
+      const entry = pending[i]!;
+      try {
+        const r = resolve(entry, 0);
+        if (!objects.has(r.oid)) objects.set(r.oid, { type: r.type, data: r.data });
+        pending.splice(i, 1);
+        progress = true;
+      } catch (err) {
+        // A failed attempt can leave entries marked as resolving; clear the
+        // set so a retry is not mistaken for a delta cycle.
+        resolving.clear();
+        if (
+          !(err instanceof Error) ||
+          !err.message.startsWith('ref-delta base ') ||
+          !err.message.includes('is neither in the pack nor in the store')
+        ) {
+          throw err;
+        }
+        // Otherwise the base is a delta later in the pack: retry next pass.
+      }
+    }
   }
+  if (pending.length > 0) resolve(pending[0]!, 0);
   return objects;
 }
 
@@ -2551,6 +3027,10 @@ interface CollectOpts {
   depth?: number;
   /** Commits whose parents are not traversed (the client's shallow boundaries). */
   stop?: ReadonlySet<string>;
+  /** deepen-since: include only commits with a committer time after this. */
+  since?: number;
+  /** deepen-not: commits reachable from the excluded refs; never included. */
+  not?: ReadonlySet<string>;
 }
 
 /**
@@ -2591,12 +3071,20 @@ function collectGitObjects(
     }
   };
   const seenCommits = new Set<string>();
+  const seenTags = new Set<string>();
   const queue: { oid: string; dist: number }[] = [];
   let qhead = 0;
+  // Commits cut by deepen-since / deepen-not: not sent, not traversed, and
+  // recorded so their included children become the new shallow boundary.
+  const cut = new Set<string>();
   const enqueueTip = (oid: string): void => {
     const obj = repo.objects.get(oid);
     if (obj === undefined) return;
     if (obj.type === 'tag') {
+      // A tag cycle (a tag pointing, directly or transitively, at itself)
+      // must terminate: each tag is followed at most once per fetch.
+      if (seenTags.has(oid)) return;
+      seenTags.add(oid);
       objects.set(oid, obj);
       enqueueTip(parseTag(obj.data).object);
       return;
@@ -2611,9 +3099,20 @@ function collectGitObjects(
     seenCommits.add(oid);
     const obj = repo.objects.get(oid);
     if (obj === undefined || obj.type !== 'commit') continue;
-    objects.set(oid, obj);
     const parsed = commitOf(repo, oid);
     if (parsed === null) continue;
+    // deepen-since: a commit at or before the timestamp is not sent, and its
+    // parents are not traversed. deepen-not: a commit reachable from an
+    // excluded ref is not sent either. Both are recorded as cut points.
+    if (opts.since !== undefined && identTime(parsed.committer) <= opts.since) {
+      cut.add(oid);
+      continue;
+    }
+    if (opts.not !== undefined && opts.not.has(oid)) {
+      cut.add(oid);
+      continue;
+    }
+    objects.set(oid, obj);
     addTreeClosure(parsed.tree);
     const atBoundary = opts.depth !== undefined && dist === opts.depth - 1;
     if (atBoundary) {
@@ -2622,6 +3121,15 @@ function collectGitObjects(
     }
     if (opts.stop !== undefined && opts.stop.has(oid)) continue;
     for (const parent of parsed.parents) queue.push({ oid: parent, dist: dist + 1 });
+  }
+  // An included commit whose parent was cut by deepen-since / deepen-not is
+  // the new shallow boundary: the parent is absent from the pack.
+  if (cut.size > 0) {
+    for (const oid of objects.keys()) {
+      const parsed = commitOf(repo, oid);
+      if (parsed === null) continue;
+      if (parsed.parents.some((p) => cut.has(p)) && !boundary.includes(oid)) boundary.push(oid);
+    }
   }
   return { objects, boundary };
 }
@@ -2718,6 +3226,12 @@ interface FetchArgs {
   depth?: number;
   /** `deepen-relative`: deepen is measured from the client's shallow boundary. */
   deepenRelative?: boolean;
+  /** `deepen-since <ts>`: only commits with a committer time after `ts` are sent. */
+  since?: number;
+  /** `deepen-not <ref>`: commits reachable from these refs are never sent. */
+  notRefs?: string[];
+  /** v0: the first want line asked for `side-band-64k`. */
+  sideband?: boolean;
 }
 
 /** Shortest parent-distance from `want` (peeled to a commit) to any of
@@ -2765,6 +3279,27 @@ function computeFetch(
   // (want -> boundary) + 1 (verified against real git 2.43: deepen=1 on a
   // depth-1 clone adds exactly one generation, also for a new tip). Without
   // the flag, deepen is the total depth from the want.
+  // deepen-not: the set of commits reachable from the excluded refs. An
+  // unknown ref is a bad request, not a silent full-depth fetch.
+  let notSet: Set<string> | undefined;
+  if (args.notRefs !== undefined && args.notRefs.length > 0) {
+    notSet = new Set<string>();
+    for (const ref of args.notRefs) {
+      const tip = repo.gitRefs.get(ref);
+      if (tip === undefined) throw new Error(`deepen-not ref not found: ${ref}`);
+      const peeled = peelToCommit(repo, tip);
+      if (peeled === null) continue;
+      const stack: string[] = [peeled];
+      while (stack.length > 0) {
+        const oid = stack.pop()!;
+        if (notSet.has(oid)) continue;
+        notSet.add(oid);
+        const parsed = commitOf(repo, oid);
+        if (parsed === null) continue;
+        for (const parent of parsed.parents) stack.push(parent);
+      }
+    }
+  }
   let wantObjects: Map<string, GitObject>;
   let wantBoundary: string[] = [];
   if (args.depth !== undefined) {
@@ -2777,7 +3312,7 @@ function computeFetch(
         const dist = distanceToBoundary(repo, want, boundarySet);
         if (dist !== null) d = args.depth + dist + 1;
       }
-      const coll = collectGitObjects(repo, [want], { depth: d });
+      const coll = collectGitObjects(repo, [want], { depth: d, since: args.since, not: notSet });
       for (const [oid, obj] of coll.objects) wantObjects.set(oid, obj);
       mergedBoundary.push(...coll.boundary);
     }
@@ -2790,9 +3325,11 @@ function computeFetch(
       return parents.length > 0 && !parents.every((p) => wantObjects.has(p));
     });
   } else {
-    const coll = collectGitObjects(repo, args.wants, {});
+    const coll = collectGitObjects(repo, args.wants, { since: args.since, not: notSet });
     wantObjects = coll.objects;
-    wantBoundary = [];
+    // No depth limit, but deepen-since / deepen-not can still cut the walk
+    // and leave a boundary behind.
+    wantBoundary = coll.boundary;
   }
   const haveSet =
     args.haves.length > 0
@@ -2815,7 +3352,7 @@ function computeFetch(
  * (content-addressed, never overwritten), so a cached response for these args
  * can never go stale — a later push changes the tip, hence the args. */
 function fetchCacheKey(prefix: string, args: FetchArgs): string {
-  return `${prefix}:${JSON.stringify([args.wants, args.haves, args.shallow, args.depth ?? null, args.deepenRelative ?? false])}`;
+  return `${prefix}:${JSON.stringify([args.wants, args.haves, args.shallow, args.depth ?? null, args.deepenRelative ?? false, args.since ?? null, args.notRefs ?? null, args.sideband ?? false])}`;
 }
 
 function fetchCachePut(repo: RepoRec, key: string, body: Buffer): Buffer {
@@ -2863,28 +3400,56 @@ function handleFetchV0(repo: RepoRec, args: FetchArgs): Buffer {
   const key = fetchCacheKey('v0', args);
   const cached = repo.fetchCache.get(key);
   if (cached !== undefined) return cached;
-  const { send, acks } = computeFetch(repo, args);
+  const { send, boundary, unshallow, acks } = computeFetch(repo, args);
   const parts: Buffer[] = [];
   if (acks.length > 0) for (const ack of acks) parts.push(pktLine(`ACK ${ack}\n`));
   else parts.push(pktLine('NAK\n'));
-  // The packfile section is always sent (even when empty) — see v2 above.
-  parts.push(sidebandWrap(writePack(repo, send), 1));
-  parts.push(encodePktLines(['flush']));
+  // The shallow boundary follows the ACK/NAK lines, before the pack — the
+  // same lines handleFetchV2 emits in its shallow-info section, as plain
+  // pkt-lines here, which is what a v0 client parses.
+  for (const oid of boundary) parts.push(pktLine(`shallow ${oid}\n`));
+  for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+  // The pack is sideband-framed only when the client asked for side-band-64k
+  // on the first want line; otherwise it follows the shallow lines raw and
+  // ends the response (no trailing flush after a raw pack).
+  const pack = writePack(repo, send);
+  if (args.sideband === true) {
+    parts.push(sidebandWrap(pack, 1));
+    parts.push(encodePktLines(['flush']));
+  } else {
+    parts.push(pack);
+  }
   return fetchCachePut(repo, key, Buffer.concat(parts));
 }
 
 // --- upload-pack ---------------------------------------------------------------
 
-function parseFetchArgs(lines: readonly string[]): FetchArgs {
+/** Parse upload-pack fetch arguments. With `v0Caps`, the first `want` line's
+ * trailing capabilities are read too (v0 carries `side-band-64k` there); v2
+ * never puts capabilities on want lines, so the option stays off for it.
+ * One parser for both protocol versions — the v0 path used to inline a copy. */
+function parseFetchArgs(lines: readonly string[], opts?: { v0Caps?: boolean }): FetchArgs {
   const args: FetchArgs = { wants: [], haves: [], shallow: [] };
+  let firstWant = true;
   for (const line of lines) {
-    if (line.startsWith('want ')) args.wants.push(line.slice(5).split(' ')[0]!);
-    else if (line.startsWith('have ')) args.haves.push(line.slice(5).trim());
+    if (line.startsWith('want ')) {
+      const tokens = line.slice(5).split(' ');
+      args.wants.push(tokens[0]!);
+      if (opts?.v0Caps === true && firstWant) args.sideband = tokens.slice(1).includes('side-band-64k');
+      firstWant = false;
+    } else if (line.startsWith('have ')) args.haves.push(line.slice(5).trim());
     else if (line.startsWith('shallow ')) args.shallow.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) {
       const n = Number.parseInt(line.slice(7).trim(), 10);
       if (Number.isFinite(n) && n > 0) args.depth = n;
     } else if (line === 'deepen-relative') args.deepenRelative = true;
+    else if (line.startsWith('deepen-since ')) {
+      const n = Number.parseInt(line.slice('deepen-since '.length).trim(), 10);
+      if (Number.isFinite(n)) args.since = n;
+    } else if (line.startsWith('deepen-not ')) {
+      const ref = line.slice('deepen-not '.length).trim();
+      if (ref !== '') (args.notRefs ??= []).push(ref);
+    }
   }
   return args;
 }
@@ -2924,7 +3489,20 @@ function handleUploadPack(repo: RepoRec, raw: Buffer, isV2: boolean): Buffer | n
       }
       return lsRefsResponse(repo, lsArgs);
     }
-    if (command === 'command=fetch') return handleFetchV2(repo, parseFetchArgs(rest));
+    if (command === 'command=fetch') {
+      const args = parseFetchArgs(rest);
+      // A fetch with no `want` is malformed, like the v0 path's empty want
+      // list — reject it instead of answering 200 with an empty pack.
+      if (args.wants.length === 0) return null;
+      try {
+        return handleFetchV2(repo, args);
+      } catch (err) {
+        // A bad deepen-not ref is a client error (400), not a server error:
+        // handleFetchV2 has no other expected throw, so rethrow the rest.
+        if (err instanceof Error && err.message.startsWith('deepen-not ref not found')) return null;
+        throw err;
+      }
+    }
     return null;
   }
   // v0: want section (until the first flush), then the have/done section.
@@ -2941,18 +3519,15 @@ function handleUploadPack(repo: RepoRec, raw: Buffer, isV2: boolean): Buffer | n
     }
   }
   const lines = [...sections[0]!, ...sections[1]!];
-  const args: FetchArgs = { wants: [], haves: [], shallow: [] };
-  for (const line of lines) {
-    if (line.startsWith('want ')) args.wants.push(line.slice(5).split(' ')[0]!);
-    else if (line.startsWith('have ')) args.haves.push(line.slice(5).trim());
-    else if (line.startsWith('shallow ')) args.shallow.push(line.slice(8).trim());
-    else if (line.startsWith('deepen ')) {
-      const n = Number.parseInt(line.slice(7).trim(), 10);
-      if (Number.isFinite(n) && n > 0) args.depth = n;
-    } else if (line === 'deepen-relative') args.deepenRelative = true;
-  }
+  const args = parseFetchArgs(lines, { v0Caps: true });
   if (args.wants.length === 0) return null;
-  return handleFetchV0(repo, args);
+  try {
+    return handleFetchV0(repo, args);
+  } catch (err) {
+    // A bad deepen-not ref is a client error (400), not a server error.
+    if (err instanceof Error && err.message.startsWith('deepen-not ref not found')) return null;
+    throw err;
+  }
 }
 
 // --- receive-pack --------------------------------------------------------------
@@ -2981,7 +3556,10 @@ function handleReceivePack(repo: RepoRec, body: Buffer): { status: number; body:
     let caps: string[] = [];
     const nul = line.indexOf('\0');
     if (nul >= 0) {
-      caps = line.slice(nul + 1).split(' ').filter(Boolean);
+      // Strip the line's trailing newline first: without it the LAST
+      // capability keeps the '\n' and an exact match (e.g. side-band-64k)
+      // fails whenever it happens to be last.
+      caps = line.slice(nul + 1).replace(/\r?\n$/, '').split(' ').filter(Boolean);
       line = line.slice(0, nul);
     }
     const parts = line.replace(/\n$/, '').split(' ');
@@ -3072,9 +3650,10 @@ function handleReceivePack(repo: RepoRec, body: Buffer): { status: number; body:
   for (const r of results) lines.push(r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason}\n`);
   lines.push('flush');
   const reportStream = encodePktLines(lines);
-  const out = sideband
-    ? Buffer.concat([sidebandWrap(reportStream, 1), encodePktLines(['flush'])])
-    : Buffer.concat([reportStream, encodePktLines(['flush'])]);
+  // The report stream already ends with the flush above; the sideband case
+  // still needs a trailing flush to terminate the band-1 stream, but the
+  // non-sideband case must not get a second one.
+  const out = sideband ? Buffer.concat([sidebandWrap(reportStream, 1), encodePktLines(['flush'])]) : reportStream;
   return { status: 200, body: out };
 }
 
@@ -3163,6 +3742,11 @@ export function createApp(): Server {
           raw = await readBody(req);
         } catch {
           sendError(res, 400, 'Request body could not be read');
+          // The oversized body was never fully read, so this connection
+          // cannot be reused: free the socket once the 400 has flushed.
+          // (Destroying the stream inside readBody would kill the socket
+          // before the 400 could be written, so it happens here instead.)
+          res.once('close', () => req.destroy());
           return;
         }
       }
@@ -3250,7 +3834,24 @@ export function createApp(): Server {
         segments.length === 3 &&
         segments[2] === 'user'
       ) {
-        sendJson(res, 200, { login: viewerLogin ?? 'forge', id: 1, type: 'User' });
+        const login = viewerLoginOf() || 'forge';
+        sendJson(res, 200, { login, id: ownerIdOf(login), type: 'User' });
+        return;
+      }
+
+      // GET /api/v3/rate_limit — the forge enforces no limit; report the
+      // real request count against GitHub's 5,000/hour authenticated budget.
+      if (
+        method === 'GET' &&
+        segments.length === 3 &&
+        segments[2] === 'rate_limit'
+      ) {
+        const used = Math.min(requestCounter, 5000);
+        const reset = Math.floor(Date.now() / 1000) + 3600;
+        sendJson(res, 200, {
+          resources: { core: { limit: 5000, remaining: 5000 - used, reset, used } },
+          rate: { limit: 5000, remaining: 5000 - used, reset, used },
+        });
         return;
       }
 
@@ -3357,13 +3958,12 @@ export function createApp(): Server {
             sendError(res, 422, 'Commit not found');
             return;
           }
-          const history: string[] = [];
-          let cursor: CommitRec | undefined = commit;
-          while (cursor !== undefined) {
-            history.push(cursor.sha);
-            cursor = cursor.parent === null ? undefined : repo.commits.get(cursor.parent);
-          }
-          const branch: BranchRec = { name: branchName, tip: sha, files: new Map(commit.files), history };
+          const branch: BranchRec = {
+            name: branchName,
+            tip: sha,
+            files: new Map(commit.files),
+            history: ancestryOf(repo, sha),
+          };
           repo.branches.set(branchName, branch);
           repo.gitRefs.set(ref, sha);
           sendJson(res, 201, { ref, object: { sha } });
@@ -3404,6 +4004,111 @@ export function createApp(): Server {
           return;
         }
 
+        // GET /api/v3/repos/{o}/{r}/git/refs — every ref the forge advertises.
+        if (rest.length === 2 && rest[0] === 'git' && rest[1] === 'refs' && method === 'GET') {
+          const out: Record<string, unknown>[] = [];
+          for (const [ref, sha] of [...repo.gitRefs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
+            out.push(gitRefEntry(repo, owner, ref, sha));
+          }
+          sendJson(res, 200, out);
+          return;
+        }
+
+        // GET /api/v3/repos/{o}/{r}/git/refs/tags/{tag} — one tag ref.
+        if (
+          rest.length >= 4 &&
+          rest[0] === 'git' &&
+          rest[1] === 'refs' &&
+          rest[2] === 'tags' &&
+          method === 'GET'
+        ) {
+          const ref = `refs/tags/${rest.slice(3).join('/')}`;
+          const sha = repo.gitRefs.get(ref);
+          if (sha === undefined) {
+            sendError(res, 404, 'Not Found');
+            return;
+          }
+          sendJson(res, 200, gitRefEntry(repo, owner, ref, sha));
+          return;
+        }
+
+        // GET /api/v3/repos/{o}/{r}/git/trees/{sha} — one tree's entries.
+        if (rest.length === 3 && rest[0] === 'git' && rest[1] === 'trees' && method === 'GET') {
+          const entries = treeOf(repo, rest[2]!);
+          if (entries === null) {
+            sendError(res, 404, 'Not Found');
+            return;
+          }
+          sendJson(res, 200, {
+            sha: rest[2],
+            tree: entries.map((entry) => {
+              const isTree = entry.mode === '40000';
+              const obj = repo.objects.get(entry.oid);
+              return {
+                path: entry.name,
+                mode: entry.mode,
+                type: isTree ? 'tree' : 'blob',
+                sha: entry.oid,
+                size: !isTree && obj !== undefined ? obj.data.length : undefined,
+                url: `/api/v3/repos/${owner}/${repo.name}/git/${isTree ? 'trees' : 'blobs'}/${entry.oid}`,
+              };
+            }),
+            truncated: false,
+          });
+          return;
+        }
+
+        // GET /api/v3/repos/{o}/{r}/git/blobs/{sha} — one blob, base64.
+        if (rest.length === 3 && rest[0] === 'git' && rest[1] === 'blobs' && method === 'GET') {
+          const obj = repo.objects.get(rest[2]!);
+          if (obj === undefined || obj.type !== 'blob') {
+            sendError(res, 404, 'Not Found');
+            return;
+          }
+          sendJson(res, 200, {
+            sha: rest[2],
+            size: obj.data.length,
+            url: `/api/v3/repos/${owner}/${repo.name}/git/blobs/${rest[2]}`,
+            content: base64Wrapped(obj.data),
+            encoding: 'base64',
+          });
+          return;
+        }
+
+        // GET /api/v3/repos/{o}/{r}/git/commits/{sha} — one commit.
+        if (rest.length === 3 && rest[0] === 'git' && rest[1] === 'commits' && method === 'GET') {
+          const sha = rest[2]!;
+          let commit = repo.commits.get(sha);
+          if (commit === undefined) {
+            const parsed = commitOf(repo, sha);
+            if (parsed === null) {
+              sendError(res, 404, 'Not Found');
+              return;
+            }
+            commit = { sha, message: parsed.message, parents: parsed.parents, treeSha: parsed.tree, files: new Map(), gpgsig: parsed.gpgsig };
+          }
+          sendJson(res, 200, commitJson(commit));
+          return;
+        }
+
+        // GET /api/v3/repos/{o}/{r}/tags — every tag ref, peeled to its commit.
+        if (rest.length === 1 && rest[0] === 'tags' && method === 'GET') {
+          const out: Record<string, unknown>[] = [];
+          for (const [ref, oid] of [...repo.gitRefs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
+            if (!ref.startsWith('refs/tags/')) continue;
+            const name = ref.slice('refs/tags/'.length);
+            const commitSha = peelToCommit(repo, oid) ?? oid;
+            out.push({
+              name,
+              commit: { sha: commitSha, url: `/api/v3/repos/${owner}/${repo.name}/git/commits/${commitSha}` },
+              zipball_url: `${originOf(req)}/api/v3/repos/${owner}/${repo.name}/zipball/${name}`,
+              tarball_url: `${originOf(req)}/api/v3/repos/${owner}/${repo.name}/tarball/${name}`,
+            });
+          }
+          sendJson(res, 200, out);
+          return;
+        }
+
         // GET /api/v3/repos/{o}/{r}/commits[?sha=]
         if (rest.length === 1 && rest[0] === 'commits' && method === 'GET') {
           const ref = query.get('sha');
@@ -3415,14 +4120,7 @@ export function createApp(): Server {
             if (branch !== undefined) history = branch.history;
             else {
               const commit = repo.commits.get(ref);
-              if (commit !== undefined) {
-                history = [];
-                let cursor: CommitRec | undefined = commit;
-                while (cursor !== undefined) {
-                  history.push(cursor.sha);
-                  cursor = cursor.parent === null ? undefined : repo.commits.get(cursor.parent);
-                }
-              }
+              if (commit !== undefined) history = ancestryOf(repo, ref);
             }
           }
           if (history === null) {
@@ -3434,7 +4132,9 @@ export function createApp(): Server {
             const commit = repo.commits.get(sha);
             if (commit !== undefined) out.push(commitJson(commit));
           }
-          sendJson(res, 200, out);
+          const { perPage, page } = pageParams(query);
+          const { slice } = paginate(out, perPage, page);
+          sendJson(res, 200, slice);
           return;
         }
 
@@ -3459,6 +4159,10 @@ export function createApp(): Server {
             }
             const content = Buffer.from(contentB64, 'base64');
             const existing = branch.files.get(filePath);
+            if (existing !== undefined && (typeof obj.sha !== 'string' || obj.sha === '')) {
+              sendError(res, 422, 'A sha is required to update a file');
+              return;
+            }
             if (existing !== undefined && typeof obj.sha === 'string' && obj.sha !== '' && obj.sha.toLowerCase() !== existing.sha.toLowerCase()) {
               sendError(res, 409, 'The file has changed since the given sha');
               return;
@@ -3489,7 +4193,7 @@ export function createApp(): Server {
                 sha: file.sha,
                 size: file.content.length,
                 encoding: 'base64',
-                content: file.content.toString('base64'),
+                content: base64Wrapped(file.content),
               });
               return;
             }
@@ -3512,7 +4216,11 @@ export function createApp(): Server {
               sendError(res, 404, 'Not Found');
               return;
             }
-            if (obj !== null && typeof obj.sha === 'string' && obj.sha !== '' && obj.sha.toLowerCase() !== existing.sha.toLowerCase()) {
+            if (obj === null || typeof obj.sha !== 'string' || obj.sha === '') {
+              sendError(res, 422, 'A sha is required to delete a file');
+              return;
+            }
+            if (typeof obj.sha === 'string' && obj.sha !== '' && obj.sha.toLowerCase() !== existing.sha.toLowerCase()) {
               sendError(res, 409, 'The file has changed since the given sha');
               return;
             }
@@ -3539,7 +4247,7 @@ export function createApp(): Server {
           }
           const existing = repo.labels.get(name);
           if (existing !== undefined) {
-            sendJson(res, 201, { name: existing.name, color: existing.color });
+            sendError(res, 422, 'Label already exists');
             return;
           }
           const label: LabelRec = { name, color: asString(obj.color, 'ededed') };
@@ -3587,7 +4295,12 @@ export function createApp(): Server {
             list.sort((a, b) => b.seq - a.seq);
             const { perPage, page } = pageParams(query);
             const { slice } = paginate(list, perPage, page);
-            sendJson(res, 200, slice.map((pull) => pullJson(repo, pull)));
+            sendJson(
+              res,
+              200,
+              slice.map((pull) => pullJson(repo, pull)),
+              pageLinkHeader(req, `/api/v3/repos/${owner}/${repo.name}/pulls`, query, list.length, perPage, page),
+            );
             return;
           }
           if (rest.length === 2) {
@@ -3598,6 +4311,17 @@ export function createApp(): Server {
               return;
             }
             if (method === 'GET') {
+              sendJson(res, 200, pullJson(repo, pull));
+              return;
+            }
+            if (method === 'PATCH') {
+              if (obj === null) {
+                sendError(res, 400, 'Request body must be a JSON object');
+                return;
+              }
+              if (typeof obj.title === 'string') pull.title = obj.title;
+              if (typeof obj.body === 'string') pull.body = obj.body;
+              if (obj.state === 'open' || obj.state === 'closed') pull.state = obj.state;
               sendJson(res, 200, pullJson(repo, pull));
               return;
             }
@@ -3639,20 +4363,18 @@ export function createApp(): Server {
               files.map((file) => {
                 const oldFile = baseFiles.get(file.path);
                 const newFile = headFiles.get(file.path);
-                const patchLines: string[] = [`--- a/${file.path}`, `+++ b/${file.path}`];
-                if (oldFile !== undefined) {
-                  for (const line of countLines(oldFile.content)) patchLines.push(`-${line}`);
-                }
-                if (newFile !== undefined) {
-                  for (const line of countLines(newFile.content)) patchLines.push(`+${line}`);
-                }
+                const patch = unifiedPatch(
+                  file.path,
+                  oldFile === undefined ? [] : countLines(oldFile.content),
+                  newFile === undefined ? [] : countLines(newFile.content),
+                );
                 return {
                   filename: file.path,
                   status: file.status,
                   additions: file.additions,
                   deletions: file.deletions,
                   changes: file.additions + file.deletions,
-                  patch: patchLines.join('\n'),
+                  patch,
                 };
               }),
             );
@@ -3667,6 +4389,11 @@ export function createApp(): Server {
           if (rest.length === 1 && method === 'POST') {
             if (obj === null) {
               sendError(res, 400, 'Request body must be a JSON object');
+              return;
+            }
+            const title = asString(obj.title, '');
+            if (title === '') {
+              sendError(res, 422, 'Issue title is required');
               return;
             }
             const rawLabels = Array.isArray(obj.labels) ? obj.labels : [];
@@ -3696,7 +4423,12 @@ export function createApp(): Server {
             }
             const { perPage, page } = pageParams(query);
             const { slice } = paginate(list, perPage, page);
-            sendJson(res, 200, slice.map((issue) => issueJson(repo, issue)));
+            sendJson(
+              res,
+              200,
+              slice.map((issue) => issueJson(repo, issue)),
+              pageLinkHeader(req, `/api/v3/repos/${owner}/${repo.name}/issues`, query, list.length, perPage, page),
+            );
             return;
           }
           if (rest.length === 2) {
@@ -3740,7 +4472,7 @@ export function createApp(): Server {
               sendJson(res, 201, {
                 id: comment.id,
                 body: comment.body,
-                user: { login: ownerLoginOf(repo), id: 1, type: 'User' },
+                user: { login: ownerLoginOf(repo), id: ownerIdOf(ownerLoginOf(repo)), type: 'User' },
                 created_at: FIXED_DATE,
                 updated_at: FIXED_DATE,
               });
@@ -3753,7 +4485,7 @@ export function createApp(): Server {
                 issue.comments.map((comment) => ({
                   id: comment.id,
                   body: comment.body,
-                  user: { login: ownerLoginOf(repo), id: 1, type: 'User' },
+                  user: { login: ownerLoginOf(repo), id: ownerIdOf(ownerLoginOf(repo)), type: 'User' },
                   created_at: FIXED_DATE,
                   updated_at: FIXED_DATE,
                 })),
